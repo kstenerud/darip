@@ -1,0 +1,8 @@
+README.md
+README.txt
+darip
+setup.py
+darip.egg-info/PKG-INFO
+darip.egg-info/SOURCES.txt
+darip.egg-info/dependency_links.txt
+darip.egg-info/top_level.txt

@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+
+# Name:        darip
+# version:     1.0.0
+# description: Bulk downloads images from Deviant Art.
+#              Use -h for help.
+#
+#
+# Copyright 2018 Karl Stenerud
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import print_function
+from __future__ import absolute_import
+import argparse
+import fake_useragent
+import mechanicalsoup
+import os
+import re
+import requests
+import sys
+import traceback
+
+class NotFoundException(Exception):
+    def __init__(self, value):
+        super(NotFoundException, self).__init__(value)
+        self.parameter = value
+
+    def __str__(self):
+        return str(self.parameter)
+
+class DARipper:
+    def __init__(self, save_path):
+        self.session = requests.Session()
+        self.session.cookies.update({'agegate_state': '1'})
+        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
+        user_agent = fake_useragent.UserAgent().random
+        self.browser = mechanicalsoup.StatefulBrowser(session=self.session, user_agent=user_agent, raise_on_404=True)
+        self.debug_mode = False
+        self.save_path = save_path
+
+    def get_links_matching(self, url_regex):
+        self.write_debug("Get links for " + url_regex)
+        return self.browser.links(url_regex=url_regex)
+
+    def get_first_link_matching(self, url_regex):
+        self.write_debug("Get first link for " + url_regex)
+        return next(iter(self.get_links_matching(url_regex)), None)
+
+    def follow_link(self, link):
+        self.write_debug("Follow link " + link.get("href"))
+        try:
+            self.browser.follow_link(link)
+        except mechanicalsoup.LinkNotFoundError as err:
+            raise NotFoundException("Followed dead link " + link.get("href"))
+
+    def follow_first_link_matching(self, url_regex):
+        self.write_debug("Follow first link for " + url_regex)
+        link = self.get_first_link_matching(url_regex)
+        if not link:
+            raise NotFoundException("No link matches regex \"" + url_regex + "\" at " + self.browser.get_url())
+        self.follow_link(link)
+
+    def get_embedded_image_url(self):
+        img_tag = next(iter(self.browser.get_current_page().find_all("img", class_="dev-content-normal")), None)
+        if img_tag:
+            return img_tag.get("src")
+        return None
+
+    def get_full_image_filename(self):
+        filename = self.get_embedded_image_filename()
+        match=re.search("(.*)-pre\\.(.*)", filename)
+        if match:
+            return match.group(1) + "." + match.group(2)
+        return filename
+
+    def get_embedded_image_filename(self):
+        url = self.get_embedded_image_url()
+        self.write_debug("Get embedded image filename for " + url)
+        if url:
+            return url.rsplit('/', 1)[-1]
+        # Not ideal, but if it comes to this, we only have the URL to work from,
+        # and no way to reliably determine the image type :/
+        return self.browser.get_url().rsplit('/', 1)[-1] + ".jpg"
+
+    def make_path(self, filename):
+        return os.path.join(self.save_path, filename)
+
+    def download_full_image_on_page(self):
+        image_link = self.get_first_link_matching(".*/download/.*")
+        if not image_link:
+            return False
+        try:
+            filename = self.get_full_image_filename()
+            print("Downloading full image " + filename)
+            self.browser.download_link(image_link, self.make_path(filename))
+            return True
+        except mechanicalsoup.LinkNotFoundError as err:
+            raise NotFoundException("Followed dead download link " + image_link.get("href"))
+
+    def download_embedded_image_on_page(self):
+        url = self.get_embedded_image_url()
+        if not url:
+            return False
+        try:
+            filename = self.get_embedded_image_filename()
+            print("Downloading embedded image " + filename)
+            response = self.browser.get(url)
+            with open(self.make_path(filename), 'wb') as f:
+                f.write(response.content)
+            return True
+        except mechanicalsoup.LinkNotFoundError as err:
+            raise NotFoundException("Followed dead download link " + url)
+
+
+
+    def navigate_to_url(self, url):
+        self.write_debug("Navigate to " + url)
+        try:
+            self.browser.open(url)
+        except mechanicalsoup.LinkNotFoundError as err:
+            raise NotFoundException("Page not found: " + str(url))
+
+    def navigate_to_artist(self, artist):
+        self.navigate_to_url("https://www.deviantart.com/" + artist)
+
+    def navigate_to_favorites(self):
+        self.follow_first_link_matching(".*favourites")
+
+    def navigate_to_gallery(self):
+        self.follow_first_link_matching(".*gallery")
+
+    def navigate_to_scraps(self):
+        self.follow_first_link_matching(".*catpath=scraps")
+
+    def navigate_to_all(self):
+        self.follow_first_link_matching(".*catpath=/")
+
+    def navigate_to_subcategory(self, name):
+        self.follow_first_link_matching(".*" + name)
+
+    def perform_query(self, text):
+        form = self.browser.select_form("#browse-search-box")
+        if not form:
+            raise NotFoundException("Can't find a search form on page " + self.browser.get_url())
+        form.set("q", text)
+        if self.debug_mode:
+            self.write_debug("Submit form:")
+            form.print_summary()
+        self.browser.submit_selected()
+
+    def generate_image_links(self):
+        self.write_debug("Get image links")
+        base_url = self.browser.get_url() + "&offset="
+        offset=0
+        while True:
+            links = self.get_links_matching(".*/art/.*")
+            if not links:
+                break
+            for link in links:
+                yield link.get("href")
+            offset += len(links)
+            self.navigate_to_url(base_url + str(offset))
+
+    def get_image_filename(self):
+        filename = self.get_full_image_filename()
+        if not filename:
+            filename = self.get_embedded_image_filename()
+        return filename
+
+    def download_image_on_page(self):
+        if not self.download_full_image_on_page():
+            if not self.download_embedded_image_on_page():
+                raise NotFoundException("Could not find downloadable image on page " + self.browser.get_url())
+
+    def enable_debug(self):
+        self.debug_mode = True
+
+    def write_debug(self, message):
+        if self.debug_mode:
+            print("DEBUG: " + message)
+
+    def debug_print_links(self, url_regex):
+        for link in self.get_links_matching(url_regex):
+            print("DEBUG: " + link)
+
+    def debug_print_hrefs(self, url_regex):
+        for link in self.get_links_matching(url_regex):
+            print("DEBUG: " + link.get("href"))
+
+
+
+def print_links(ripper):
+    for link in ripper.generate_image_links():
+        ripper.navigate_to_url(link)
+        print(ripper.get_image_filename())
+    
+def download_links(ripper):
+    for link in ripper.generate_image_links():
+        ripper.navigate_to_url(link)
+        ripper.download_image_on_page()
+    
+def download_first_link(ripper):
+    for link in ripper.generate_image_links():
+        ripper.navigate_to_url(link)
+        ripper.download_image_on_page()
+        break;
+
+def error_exit(message):
+    print(message, file=sys.stderr)
+    exit(1)
+
+def bug_exit(message=None):
+    if message:
+        print(message, file=sys.stderr)
+    print("This may be a bug. Please do the following:", file=sys.stderr)
+    print(" * Re-run the command with debug enabled (-D)", file=sys.stderr)
+    print(" * Go to https://github.com/kstenerud/darip/issues", file=sys.stderr)
+    print(" * Check that the issue hasn't been reported yet", file=sys.stderr)
+    print(" * Open a new issue:", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("    OS: (OS and version)", file=sys.stderr)
+    print("    Command Line: (the command as you typed it)", file=sys.stderr)
+    print("    Output: (the debug output and stack trace)", file=sys.stderr)
+    print("    + any other relevant info", file=sys.stderr)
+    exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('artist', type=str, help='Select artist')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-g', '--gallery', action="store_true", help='Look in the artist\'s gallery')
+    group.add_argument('-f', '--favorites', action="store_true", help='Look in the artist\'s favorites')
+    parser.add_argument('-s', '--subcategory', type=str, default="ALL", help='Specify a subcategory of the artist\'s favorites or gallery. It will select the first subcategory that ENDS with the specified text. Special categories: SCRAPS, FEATURED, ALL (default ALL)')
+    parser.add_argument('-q', '--query', type=str, help='Execute a search query inside the selected gallery/favorites/category')
+    parser.add_argument('-p', '--path', type=str, default=".", help='Path to save images to. (default current directory)')
+    parser.add_argument('-P', '--printonly', action="store_true", help='Only print the file names, don\'t download')
+    parser.add_argument('-D', '--debug', action="store_true", help='Print debug information during operation')
+
+    args = parser.parse_args()
+
+    if not os.path.exists(args.path):
+        error_exit(args.path + ": No such directory")
+    if not os.path.isdir(args.path):
+        error_exit(args.path + " is not a directory")
+
+    ripper = DARipper(args.path)
+    if args.debug:
+        ripper.enable_debug()
+
+    try:
+        print("Selecting artist " + args.artist)
+        ripper.navigate_to_artist(args.artist)
+    except NotFoundException:
+        error_exit(args.artist + ": Artist not found")
+
+    if args.gallery:
+        printf("Downloading from gallery")
+        ripper.navigate_to_gallery()
+    elif args.favorites:
+        printf("Downloading from favorites")
+        ripper.navigate_to_favorites()
+    else:
+        error_exit("Error: Must specify at least gallery (-g) or favorites (-f)")
+
+    if args.subcategory:
+        if args.subcategory == "ALL":
+            print("Downloading all images")
+            ripper.navigate_to_all()
+        elif args.subcategory == "SCRAPS":
+            if args.favorites:
+                error_exit("The favorites section doesn't support scraps")
+            print("Downloading scraps")
+            ripper.navigate_to_scraps()
+        elif args.subcategory == "FEATURED":
+            print("Downloading featured images")
+        else:
+            try:
+                ripper.navigate_to_subcategory(args.subcategory)
+            except NotFoundException:
+                error_exit(args.subcategory + ": Subcategory not found")
+
+    if args.query:
+        ripper.perform_query(args.query)
+
+    if args.printonly:
+        print("Printing links only:")
+        print_links(ripper)
+    else:
+        print("Downloading:")
+        download_links(ripper)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        error_exit("Interrupt. Aborting.")
+    except Exception as err:
+        print(traceback.format_exc(), file=sys.stderr)
+        bug_exit()
